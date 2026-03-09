@@ -1,30 +1,32 @@
 #include <Arduino.h>
 #include <SPI.h>
 
+SPIClass spiA(VSPI); // Producer: writes to slave VSPI
+SPIClass spiB(HSPI); // Consumer: reads from slave HSPI
 
-// Two SPI masters on one ESP32
-SPIClass spiA(VSPI); // will talk to SLAVE VSPI pins (GPIO 18/19/23/5 on slave)
-SPIClass spiB(HSPI); // will talk to SLAVE HSPI pins (GPIO 14/12/13/15 on slave)
-
-// ===============================
-// MASTER PINS (ESP32 #2 MASTER)
-// Set these to the GPIOs you physically wired.
-// ===============================
-
-// Bus A (writes into FIFO via slave VSPI)
+// Adjust to your MASTER wiring
 #define A_SCLK 18
 #define A_MISO 19
 #define A_MOSI 23
 #define A_CS   5
 
-// Bus B (reads from FIFO via slave HSPI)
 #define B_SCLK 14
 #define B_MISO 12
 #define B_MOSI 13
 #define B_CS   15
 
+// Slave -> Master GPIO (wire from SLAVE DRAIN_REQ_PIN)
+#define DRAIN_REQ_PIN 27
+
 static inline void cs_low(int pin)  { digitalWrite(pin, LOW); }
 static inline void cs_high(int pin) { digitalWrite(pin, HIGH); }
+
+volatile bool drain_requested = false;
+
+void IRAM_ATTR onDrainReqRise()
+{
+  drain_requested = true;
+}
 
 uint8_t sendByteToVSPI(uint8_t b)
 {
@@ -40,10 +42,29 @@ uint8_t readByteFromHSPI()
 {
   spiB.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
   cs_low(B_CS);
-  uint8_t b = spiB.transfer(0x00); // dummy byte to clock out 1 byte from slave
+  uint8_t b = spiB.transfer(0x00); // dummy clocks to read 1 byte
   cs_high(B_CS);
   spiB.endTransaction();
   return b;
+}
+
+void drainWhileRequested()
+{
+  // Drain until slave lowers DRAIN_REQ (i.e., fifo_count <= LOW_WM)
+  // This naturally handles "intaking new bytes while draining".
+  uint32_t n = 0;
+
+  while (digitalRead(DRAIN_REQ_PIN) == HIGH) {
+    (void)readByteFromHSPI();   // <-- capture the byte
+    n++;
+
+    // Optional: avoid Serial spam; print occasionally
+    if ((n % 256) == 0) {
+      Serial.printf("Drained %lu bytes...\n", (unsigned long)n);
+    }
+  }
+
+  Serial.printf("Drain cycle complete. Drained %lu bytes.\n", (unsigned long)n);
 }
 
 void setup()
@@ -54,26 +75,33 @@ void setup()
   pinMode(A_CS, OUTPUT); cs_high(A_CS);
   pinMode(B_CS, OUTPUT); cs_high(B_CS);
 
-  // Init buses with explicit pins
+  pinMode(DRAIN_REQ_PIN, INPUT); // consider INPUT_PULLDOWN if line floats during reset
+
   spiA.begin(A_SCLK, A_MISO, A_MOSI, A_CS);
   spiB.begin(B_SCLK, B_MISO, B_MOSI, B_CS);
 
-  Serial.println("Dual SPI Master ready.");
+  attachInterrupt(digitalPinToInterrupt(DRAIN_REQ_PIN), onDrainReqRise, RISING);
+
+  Serial.println("Master ready: drain when FIFO full.");
 }
 
 void loop()
 {
-  static uint8_t x = 0x00; // start value
+  // Example producer: keep writing bytes into FIFO
+  static uint8_t x = 0;
+  sendByteToVSPI(x++);
+  // Adjust producer rate to match your real application
+  // If you produce too fast and never drain enough, you will overflow.
+  delayMicroseconds(200); 
 
-  // 1) Write one byte into FIFO (VSPI -> slave)
-  uint8_t vspi_reply = sendByteToVSPI(x);
+  // Drain only when requested
+  if (drain_requested) {
+    drain_requested = false;
 
-  // 2) Read one byte out of FIFO (HSPI <- slave)
-  uint8_t out = readByteFromHSPI();
-
-  Serial.printf("Sent: 0x%02X  (VSPI reply: 0x%02X)  Read: 0x%02X\n",
-                x, vspi_reply, out);
-
-  x++; // change value each loop to prove FIFO ordering
-  delay(200);
+    // If it’s still high, do the drain cycle
+    if (digitalRead(DRAIN_REQ_PIN) == HIGH) {
+      Serial.println("DRAIN_REQ high -> starting drain cycle...");
+      drainWhileRequested();
+    }
+  }
 }
