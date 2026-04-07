@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+import time
+import spidev
+import Jetson.GPIO as GPIO
+
+# ============================================================
+# CHANGE THESE TO MATCH YOUR JETSON SETUP
+# ============================================================
+
+# Use BOARD numbering for Jetson header pins.
+GPIO.setmode(GPIO.BOARD)
+
+# Example only:
+# REQ_IN_PIN is the Jetson header pin wired to ESP32 GPIO27.
+# ENABLE_OUT_PIN is optional, if you also wire a Jetson pin to ESP32 GPIO26.
+REQ_IN_PIN = 18
+ENABLE_OUT_PIN = 16   # optional; set to None if unused
+
+# SPI device to use on Jetson
+SPI_BUS = 0
+SPI_DEV = 0
+
+SPI_SPEED_HZ = 1000000
+SPI_MODE = 0
+
+# How many old FIFO bytes to drain first
+INITIAL_DRAIN_COUNT = 2048
+
+# ============================================================
+# GPIO SETUP
+# ============================================================
+GPIO.setup(REQ_IN_PIN, GPIO.IN)
+
+if ENABLE_OUT_PIN is not None:
+    GPIO.setup(ENABLE_OUT_PIN, GPIO.OUT, initial=GPIO.LOW)
+    # LOW means "drain allowed" for your ESP32 logic
+
+# ============================================================
+# SPI SETUP
+# ============================================================
+spi = spidev.SpiDev()
+spi.open(SPI_BUS, SPI_DEV)
+spi.max_speed_hz = SPI_SPEED_HZ
+spi.mode = SPI_MODE
+spi.bits_per_word = 8
+
+sensor_counter = 0
+
+def next_sensor_byte():
+    global sensor_counter
+    b = sensor_counter & 0xFF
+    sensor_counter = (sensor_counter + 1) & 0xFF
+    return b
+
+def spi_exchange_one(tx_byte: int) -> int:
+    # 1-byte transaction to match the ESP32 slave's 8-bit queued transfer
+    rx = spi.xfer2([tx_byte])
+    return rx[0]
+
+def drain_n_bytes(n: int):
+    drained = []
+    for i in range(n):
+        txb = next_sensor_byte()      # hypothetical sensor byte
+        rxb = spi_exchange_one(txb)   # read old FIFO byte, send new byte in
+        drained.append(rxb)
+
+        if (i + 1) % 256 == 0:
+            print(f"Initial drain: {i+1}/{n}")
+
+    return drained
+
+def stream_while_requested():
+    count = 0
+    while GPIO.input(REQ_IN_PIN) == GPIO.HIGH:
+        txb = next_sensor_byte()
+        rxb = spi_exchange_one(txb)
+        count += 1
+
+        if count % 256 == 0:
+            print(f"Streaming while request high... exchanged {count} bytes, last rx=0x{rxb:02X}")
+
+def main():
+    print("Jetson SPI master ready.")
+    print("Waiting for ESP32 request pin to go HIGH...")
+
+    try:
+        while True:
+            # If already high, don't miss it
+            if GPIO.input(REQ_IN_PIN) == GPIO.HIGH:
+                print("Request HIGH detected.")
+
+                if ENABLE_OUT_PIN is not None:
+                    GPIO.output(ENABLE_OUT_PIN, GPIO.LOW)
+
+                # Phase 1: pull out the first 2048 bytes
+                drained = drain_n_bytes(INITIAL_DRAIN_COUNT)
+                print(f"Initial 2048-byte drain complete. First 16 bytes: {[hex(b) for b in drained[:16]]}")
+
+                # Phase 2: keep exchanging while request stays high
+                stream_while_requested()
+
+                print("Request went LOW, stopping SPI drain/stream.")
+                time.sleep(0.01)
+                continue
+
+            # Wait briefly before polling again
+            time.sleep(0.001)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        spi.close()
+        GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()
